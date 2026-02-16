@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu Feb  5 18:39:39 2026
-
-@author: asus
+GPR Data Processor with Coordinate Import & Aspect Control
+Self-contained – no external GPR libraries required.
 """
 
 import streamlit as st
@@ -11,7 +10,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import tempfile
 import os
-from pathlib import Path
+import struct                     # needed for the DZT reader
 import warnings
 import json
 from scipy import signal
@@ -32,7 +31,7 @@ st.set_page_config(
 st.title("📡 GPR Data Processor with Coordinate Import & Aspect Control")
 st.markdown("Process GPR data with CSV coordinate import, interpolation, and aspect ratio control")
 
-# Custom CSS
+# Custom CSS (unchanged)
 st.markdown("""
 <style>
     .stProgress > div > div > div > div {
@@ -427,13 +426,15 @@ with st.sidebar:
     
     process_btn = st.button("🚀 Process Data", type="primary", use_container_width=True)
 
-# Helper functions
+
+# ------------------------------------------------------------------------------
+#                           DZT READER (self‑contained)
+# ------------------------------------------------------------------------------
 class DZTHeader:
     """
     Minimal DZT header parser based on common GSSI structure.
-    Works for most SIR-3000 / SIR-4000 style files.
+    Works for most SIR‑3000 / SIR‑4000 style files.
     """
-
     def __init__(self):
         self.samples = None
         self.traces = None
@@ -452,14 +453,12 @@ def read_dzt(filepath, verbose=False):
         [data_array]  -> list with one 2D numpy array (samples x traces)
         gps           -> None (placeholder)
     """
-
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"File not found: {filepath}")
 
     header = DZTHeader()
 
     with open(filepath, "rb") as f:
-
         # --------------------------------------------------
         # 1. Read fixed header block (first 1024 bytes)
         # --------------------------------------------------
@@ -468,13 +467,10 @@ def read_dzt(filepath, verbose=False):
         # Common GSSI DZT offsets (empirical standard layout)
         # NOTE: offsets may vary slightly depending on firmware,
         # but this works for most modern DZT files.
-
         header.samples = struct.unpack("<H", header_bytes[0:2])[0]
         header.bits = struct.unpack("<H", header_bytes[2:4])[0]
         header.traces = struct.unpack("<I", header_bytes[4:8])[0]
-
         header.time_window = struct.unpack("<f", header_bytes[8:12])[0]
-
         # Data offset usually stored at byte 512 or fixed at 1024
         header.data_offset = 1024
 
@@ -544,7 +540,7 @@ def read_dzt(filepath, verbose=False):
     data = data.astype(np.float32)
 
     # ------------------------------------------------------
-    # 7. Build return structure (compatible with readgssi)
+    # 7. Build return structure (compatible with original)
     # ------------------------------------------------------
     header_dict = {
         "samples": header.samples,
@@ -555,10 +551,14 @@ def read_dzt(filepath, verbose=False):
     }
 
     arrays = [data]
-    gps = None  # You can implement DZG parsing later if needed
+    gps = None  # DZG parsing can be added later if needed
 
     return header_dict, arrays, gps
 
+
+# ------------------------------------------------------------------------------
+#                      Processing helper functions
+# ------------------------------------------------------------------------------
 def apply_gain(array, gain_type, **kwargs):
     """Apply time-varying gain to radar data"""
     n_samples, n_traces = array.shape
@@ -619,6 +619,7 @@ def apply_gain(array, gain_type, **kwargs):
         return array * gain_vector
     
     return array
+
 
 def apply_near_surface_correction(array, correction_type, correction_depth, max_depth, **kwargs):
     """Apply near-surface amplitude correction to reduce high amplitudes in shallow region"""
@@ -708,9 +709,11 @@ def apply_near_surface_correction(array, correction_type, correction_depth, max_
     
     return result
 
+
 def reverse_array(array):
     """Reverse the array along the trace axis (flip A->B to B->A)"""
     return array[:, ::-1]
+
 
 def apply_trace_mute(array, mute_params, x_axis=None, coordinates=None):
     """
@@ -819,6 +822,7 @@ def apply_trace_mute(array, mute_params, x_axis=None, coordinates=None):
     
     return muted_array, mute_mask
 
+
 def apply_multiple_mute_zones(array, mute_zones, x_axis=None, coordinates=None):
     """
     Apply multiple mute zones to the radar array
@@ -858,6 +862,7 @@ def apply_multiple_mute_zones(array, mute_zones, x_axis=None, coordinates=None):
     
     return muted_array, combined_mask
 
+
 def calculate_fft(trace, sampling_rate=1000):
     """Calculate FFT of a trace"""
     n = len(trace)
@@ -868,6 +873,7 @@ def calculate_fft(trace, sampling_rate=1000):
     magnitude = 2.0/n * np.abs(yf[:n//2])
     
     return xf, magnitude
+
 
 def process_coordinates(coords_df, n_traces, trace_col=None, method='linear'):
     """
@@ -961,6 +967,7 @@ def process_coordinates(coords_df, n_traces, trace_col=None, method='linear'):
         st.error(f"Error interpolating coordinates: {str(e)}")
         return None
 
+
 def scale_axes(array_shape, depth_unit, max_depth, distance_unit, total_distance, coordinates=None):
     """Create scaled axis arrays based on user input"""
     n_samples, n_traces = array_shape
@@ -1001,6 +1008,7 @@ def scale_axes(array_shape, depth_unit, max_depth, distance_unit, total_distance
     
     return x_axis, y_axis, x_label, y_label, distance_unit, total_distance
 
+
 def get_aspect_ratio(mode, manual_ratio=None, data_shape=None):
     """Calculate aspect ratio based on mode"""
     if mode == "Auto":
@@ -1016,6 +1024,7 @@ def get_aspect_ratio(mode, manual_ratio=None, data_shape=None):
         return data_shape[0] / data_shape[1] * 0.5  # Default aspect
     else:
         return "auto"
+
 
 def get_window_indices(x_axis, y_axis, depth_min, depth_max, distance_min, distance_max):
     """Convert user-specified window coordinates to array indices"""
@@ -1046,18 +1055,13 @@ def get_window_indices(x_axis, y_axis, depth_min, depth_max, distance_min, dista
         'dist_max_val': x_axis[dist_idx_max]
     }
 
-# Main content
+
+# ------------------------------------------------------------------------------
+#                           Main processing block
+# ------------------------------------------------------------------------------
 if dzt_file and process_btn:
     with st.spinner("Processing radar data..."):
         try:
-            # Try to import readgssi
-            try:
-                from my_dzt_reader import read_dzt
-            except ImportError:
-                st.error("⚠️ readgssi not installed! Please run:")
-                st.code("pip install readgssi")
-                st.stop()
-            
             # Create progress bar
             progress_bar = st.progress(0)
             
@@ -1092,34 +1096,9 @@ if dzt_file and process_btn:
                 
                 progress_bar.progress(40)
                 
-                # Build parameters for readgssi
-                params = {
-                    'infile': dzt_path,
-                    'zero': [time_zero],
-                    'verbose': False
-                }
-                
-                # Add stacking
-                if stacking == "auto":
-                    params['stack'] = 'auto'
-                elif stacking == "manual":
-                    params['stack'] = stack_value
-                
-                # Add BGR
-                if bgr:
-                    if bgr_type == "Full-width":
-                        params['bgr'] = 0
-                    else:
-                        params['bgr'] = bgr_window
-                
-                # Add frequency filter
-                if freq_filter:
-                    params['freqmin'] = freq_min
-                    params['freqmax'] = freq_max
-                
-                progress_bar.progress(50)
-                
-                # Read data
+                # ----------------------
+                # READ DZT (self‑contained)
+                # ----------------------
                 header, arrays, gps = read_dzt(dzt_path, verbose=False)
 
                 progress_bar.progress(70)
@@ -1342,7 +1321,10 @@ if dzt_file and process_btn:
             st.error(f"Error processing data: {str(e)}")
             st.code(str(e))
 
-# Display results if data is loaded
+
+# ------------------------------------------------------------------------------
+#                           Display results (tabs)
+# ------------------------------------------------------------------------------
 if st.session_state.data_loaded:
     # Create tabs
     tab_names = ["📊 Header Info", "📈 Full View", "🔍 Custom Window", "🗺️ Coordinate View", "📉 FFT Analysis", "🎛️ Gain Analysis", "💾 Export"]
@@ -2370,7 +2352,7 @@ st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: #666;'>"
     "📡 <b>GPR Data Processor v6.0</b> | Line Reversal & Trace Muting | "
-    "Built with Streamlit & readgssi"
+    "Built with Streamlit"
     "</div>",
     unsafe_allow_html=True
 )
