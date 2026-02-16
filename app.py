@@ -472,7 +472,7 @@ def read_dzt(filepath, verbose=False):
         header.traces = struct.unpack("<I", header_bytes[4:8])[0]
         header.time_window = struct.unpack("<f", header_bytes[8:12])[0]
         # Data offset usually stored at byte 512 or fixed at 1024
-        header.data_offset = 1024
+        header.data_offset = 2048
 
         # Antenna frequency (often stored around byte 32–36)
         try:
@@ -502,8 +502,8 @@ def read_dzt(filepath, verbose=False):
             dtype = np.int8
         else:
             st.warning(f"Unsupported bit depth {header.bits}. Attempting to read as 16‑bit (most common).")
-            dtype = np.int32
-            header.bits = 32   # override
+            dtype = np.int16
+            header.bits = 16   # override
 
         # --------------------------------------------------
         # 3. Read full data block
@@ -2357,6 +2357,7 @@ st.markdown(
     "</div>",
     unsafe_allow_html=True
 )
+
 
 
 
