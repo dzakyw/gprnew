@@ -4,7 +4,7 @@ numpy
 pandas
 matplotlib
 scipy
-git+https://github.com/iannesbitt/readgssi.git
+git+https://github.com/iannesbitt/readgssi.git@main#egg=readgssi
 pynmea2
 geopy
 pytz
