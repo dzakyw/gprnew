@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 GPR Data Processor with Coordinate Import & Aspect Control
-Self-contained – no external GPR libraries required.
+Self-contained – uses a new, robust DZT reader (translated from R rgpr).
 """
 
 import streamlit as st
@@ -14,8 +14,8 @@ import struct                     # needed for the DZT reader
 import warnings
 import json
 from scipy import signal
-from scipy.fft import fft, fftfreq, fftshift
-from scipy.interpolate import interp1d, griddata
+from scipy.fft import fft, fftfreq
+from scipy.interpolate import interp1d
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Patch
 warnings.filterwarnings('ignore')
@@ -83,10 +83,20 @@ st.markdown("""
 # Initialize session state
 if 'data_loaded' not in st.session_state:
     st.session_state.data_loaded = False
-if 'original_array' not in st.session_state:
-    st.session_state.original_array = None
-if 'processed_array' not in st.session_state:
-    st.session_state.processed_array = None
+if 'original_arrays' not in st.session_state:
+    st.session_state.original_arrays = None          # list of arrays per channel
+if 'processed_arrays' not in st.session_state:
+    st.session_state.processed_arrays = None
+if 'depth_arrays_ns' not in st.session_state:
+    st.session_state.depth_arrays_ns = None          # list of depth axes (ns)
+if 'pos_array' not in st.session_state:
+    st.session_state.pos_array = None                 # common position array
+if 'n_channels' not in st.session_state:
+    st.session_state.n_channels = 0
+if 'selected_channel' not in st.session_state:
+    st.session_state.selected_channel = 0
+if 'channel_names' not in st.session_state:
+    st.session_state.channel_names = []
 if 'coordinates' not in st.session_state:
     st.session_state.coordinates = None
 if 'interpolated_coords' not in st.session_state:
@@ -424,142 +434,177 @@ with st.sidebar:
         with col2:
             freq_max = st.number_input("Max Freq (MHz)", 10, 1000, 130)
     
+    st.markdown("---")
+    st.header("📡 Channel Selection")
+    # This will be populated after data is loaded
+    if st.session_state.data_loaded and st.session_state.n_channels > 0:
+        if st.session_state.n_channels > 1:
+            st.session_state.selected_channel = st.selectbox(
+                "Display Channel",
+                options=list(range(st.session_state.n_channels)),
+                format_func=lambda i: f"Channel {i+1} ({st.session_state.channel_names[i]})" if st.session_state.channel_names[i] else f"Channel {i+1}"
+            )
+        else:
+            st.session_state.selected_channel = 0
+            st.info("Single‑channel file.")
+    
+    st.markdown("---")
     process_btn = st.button("🚀 Process Data", type="primary", use_container_width=True)
 
 
 # ------------------------------------------------------------------------------
-#                           DZT READER (self‑contained)
+#                           DZT READER (new, robust)
 # ------------------------------------------------------------------------------
-class DZTHeader:
-    """
-    Minimal DZT header parser based on common GSSI structure.
-    Works for most SIR‑3000 / SIR‑4000 style files.
-    """
-    def __init__(self):
-        self.samples = None
-        self.traces = None
-        self.bits = None
-        self.time_window = None
-        self.data_offset = None
-        self.antenna_frequency = None
-
-
 def read_dzt(filepath, verbose=False):
     """
-    Read GSSI .dzt file without external libraries.
-
-    Returns:
-        header_dict
-        [data_array]  -> list with one 2D numpy array (samples x traces)
-        gps           -> None (placeholder)
+    Read GSSI .dzt file following the logic of the R 'rgpr' package.
+    Returns a dictionary with keys:
+        header : dict of header fields
+        data   : list of 2D numpy arrays (samples x traces) for each channel
+        depth  : list of 1D depth arrays for each channel (in nanoseconds)
+        pos    : 1D array of positions along profile (same length as traces)
+        markers: list of marker values for each trace (from channel 1, second sample)
     """
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"File not found: {filepath}")
 
-    header = DZTHeader()
+    MINHEADSIZE = 1024
+    header = {}
 
     with open(filepath, "rb") as f:
-        # --------------------------------------------------
-        # 1. Read fixed header block (first 1024 bytes)
-        # --------------------------------------------------
-        header_bytes = f.read(1024)
+        # ------------------------------------------------------------------
+        # 1. Read fixed header (sequential, little-endian)
+        # ------------------------------------------------------------------
+        header['TAG']          = struct.unpack('<H', f.read(2))[0]
+        header['OFFSETDATA']   = struct.unpack('<H', f.read(2))[0]
+        header['NSAMP']        = struct.unpack('<H', f.read(2))[0]
+        header['BITS']         = struct.unpack('<H', f.read(2))[0]
+        header['ZERO']         = struct.unpack('<h', f.read(2))[0]   # signed short
+        header['SPS']          = struct.unpack('<f', f.read(4))[0]
+        header['SPM']          = struct.unpack('<f', f.read(4))[0]
+        header['MPM']          = struct.unpack('<f', f.read(4))[0]
+        header['POSITION']     = struct.unpack('<f', f.read(4))[0]
+        header['RANGE']        = struct.unpack('<f', f.read(4))[0]
+        header['NPASS']        = struct.unpack('<H', f.read(2))[0]
 
-        # Common GSSI DZT offsets (empirical standard layout)
-        # NOTE: offsets may vary slightly depending on firmware,
-        # but this works for most modern DZT files.
-        header.samples = struct.unpack("<H", header_bytes[0:2])[0]
-        header.bits = struct.unpack("<H", header_bytes[2:4])[0]
-        header.traces = struct.unpack("<I", header_bytes[4:8])[0]
-        header.time_window = struct.unpack("<f", header_bytes[8:12])[0]
-        # Data offset usually stored at byte 512 or fixed at 1024
-        header.data_offset = 2048
+        # Skip to offset 44 (date/time are at 32 and 36, but we skip for now)
+        f.seek(44, os.SEEK_SET)
 
-        # Antenna frequency (often stored around byte 32–36)
-        try:
-            header.antenna_frequency = struct.unpack("<f", header_bytes[32:36])[0]
-        except:
-            header.antenna_frequency = None
+        header['OFFSETTEXT']   = struct.unpack('<H', f.read(2))[0]
+        header['NTEXT']        = struct.unpack('<H', f.read(2))[0]
+        header['PROC']         = struct.unpack('<H', f.read(2))[0]
+        header['NPROC']        = struct.unpack('<H', f.read(2))[0]
+        header['NCHAN']        = struct.unpack('<H', f.read(2))[0]
+        if header['NCHAN'] < 1:
+            header['NCHAN'] = 1
+
+        header['EPSR']         = struct.unpack('<f', f.read(4))[0]
+        header['TOP']          = struct.unpack('<f', f.read(4))[0]
+        header['DEPTH']        = struct.unpack('<f', f.read(4))[0]
+
+        # Go to antenna name positions (offset 98 + 1024*(i-1))
+        ant_names = []
+        for i in range(header['NCHAN']):
+            f.seek(98 + MINHEADSIZE * i, os.SEEK_SET)
+            raw = f.read(14).decode('ascii', errors='ignore').strip('\x00')
+            ant_names.append(raw)
+        header['ANT'] = ant_names
+
+        header['VSBYTE']       = struct.unpack('<H', f.read(2))[0]
+
+        # ------------------------------------------------------------------
+        # 2. Determine offset to data
+        # ------------------------------------------------------------------
+        if header['OFFSETDATA'] < MINHEADSIZE:
+            data_offset = MINHEADSIZE * header['OFFSETDATA']
+        else:
+            data_offset = MINHEADSIZE * header['NCHAN']
+
+        # Get file size
+        f.seek(0, os.SEEK_END)
+        file_size = f.tell()
+        f.seek(data_offset, os.SEEK_SET)
+
+        # ------------------------------------------------------------------
+        # 3. Read all data
+        # ------------------------------------------------------------------
+        bytes_per_sample = header['BITS'] // 8
+        samples_per_trace = header['NSAMP']
+        n_traces_total = (file_size - data_offset) // (header['NCHAN'] * samples_per_trace * bytes_per_sample)
+
+        if header['BITS'] == 8:
+            dtype = np.int8
+            data_raw = np.fromfile(f, dtype=dtype, count=samples_per_trace * n_traces_total * header['NCHAN'])
+            # Adjust for unsigned interpretation (like R code)
+            data_raw = data_raw.astype(np.int32)
+            data_raw[data_raw >= 0] -= 128
+            data_raw[data_raw < 0]  += 127
+        elif header['BITS'] == 16:
+            dtype = np.int16
+            data_raw = np.fromfile(f, dtype=dtype, count=samples_per_trace * n_traces_total * header['NCHAN'])
+            data_raw = data_raw.astype(np.int32)
+            data_raw[data_raw >= 0] -= 32768
+            data_raw[data_raw < 0]  += 32767
+        elif header['BITS'] == 32:
+            dtype = np.int32
+            data_raw = np.fromfile(f, dtype=dtype, count=samples_per_trace * n_traces_total * header['NCHAN'])
+        else:
+            raise ValueError(f"Unsupported bit depth: {header['BITS']}")
+
+        # Reshape into matrix: rows = samples_per_trace, cols = total_traces * NCHAN
+        A = data_raw.reshape(samples_per_trace, n_traces_total * header['NCHAN'])
+
+        # ------------------------------------------------------------------
+        # 4. Split channels and extract markers
+        # ------------------------------------------------------------------
+        data_channels = []
+        markers = None
+        for ch in range(header['NCHAN']):
+            # columns for this channel: ch, ch+NCHAN, ch+2*NCHAN, ...
+            cols = slice(ch, None, header['NCHAN'])
+            ch_data = A[:, cols].copy()   # shape (samples_per_trace, n_traces_total)
+
+            if ch == 0:
+                # First channel: second row contains markers
+                markers = ch_data[1, :].copy()   # integer marker values
+                # Remove first two rows (sync and marker)
+                ch_data = ch_data[2:, :]
+            data_channels.append(ch_data)
+
+        # ------------------------------------------------------------------
+        # 5. Build depth and position vectors
+        # ------------------------------------------------------------------
+        # Depth for channel 1 (after removing 2 rows) and other channels
+        depth_full = np.arange(header['NSAMP']) * header['RANGE'] / (header['NSAMP'] - 1)
+        depth_chan0 = depth_full[2:]   # for channel 1
+        depth_others = depth_full      # for channels >1
+        depth_list = [depth_chan0] + [depth_others] * (header['NCHAN'] - 1)
+
+        # Position along profile
+        if header['SPM'] > 0:
+            pos = np.arange(n_traces_total) / header['SPM']
+        else:
+            pos = np.arange(n_traces_total)   # fallback: trace index
 
         if verbose:
             print("DZT HEADER INFO")
-            print("Samples per trace:", header.samples)
-            print("Number of traces :", header.traces)
-            print("Bits per sample  :", header.bits)
-            print("Time window (ns) :", header.time_window)
-            print("Antenna freq MHz :", header.antenna_frequency)
+            for k, v in header.items():
+                print(f"  {k}: {v}")
+            print(f"  Computed traces: {n_traces_total}")
+            print(f"  Data shape per channel: {[d.shape for d in data_channels]}")
+            print(f"  Position range: {pos[0]:.2f} – {pos[-1]:.2f}")
 
-        # --------------------------------------------------
-        # 2. Move to data section
-        # --------------------------------------------------
-        f.seek(header.data_offset)
-
-        # Determine numpy dtype from bits
-        if header.bits == 16:
-            dtype = np.int16
-        elif header.bits == 32:
-            dtype = np.int32
-        elif header.bits == 8:
-            dtype = np.int8
-        else:
-            st.warning(f"Unsupported bit depth {header.bits}. Attempting to read as 16‑bit (most common).")
-            dtype = np.int16
-            header.bits = 16   # override
-
-        # --------------------------------------------------
-        # 3. Read full data block
-        # --------------------------------------------------
-        data = np.fromfile(f, dtype=dtype)
-
-    # ------------------------------------------------------
-    # 4. Safety check: compute traces if header incorrect
-    # ------------------------------------------------------
-    total_samples = len(data)
-
-    if header.samples is None or header.samples == 0:
-        raise ValueError("Invalid number of samples in header.")
-
-    computed_traces = total_samples // header.samples
-
-    if header.traces is None or header.traces == 0:
-        header.traces = computed_traces
-
-    if computed_traces != header.traces:
-        # Header sometimes wrong — trust file size
-        header.traces = computed_traces
-
-    # ------------------------------------------------------
-    # 5. Reshape properly (samples x traces)
-    # ------------------------------------------------------
-    data = data[: header.samples * header.traces]
-    data = data.reshape((header.traces, header.samples))
-
-    # Transpose to match standard processing (samples x traces)
-    data = data.T
-
-    # ------------------------------------------------------
-    # 6. Convert to float for processing pipeline
-    # ------------------------------------------------------
-    data = data.astype(np.float32)
-
-    # ------------------------------------------------------
-    # 7. Build return structure (compatible with original)
-    # ------------------------------------------------------
-    header_dict = {
-        "samples": header.samples,
-        "traces": header.traces,
-        "bits": header.bits,
-        "time_window_ns": header.time_window,
-        "antenna_frequency_mhz": header.antenna_frequency,
-    }
-
-    arrays = [data]
-    gps = None  # DZG parsing can be added later if needed
-
-    return header_dict, arrays, gps
+        return {
+            'header': header,
+            'data': data_channels,
+            'depth': depth_list,
+            'pos': pos,
+            'markers': markers
+        }
 
 
 # ------------------------------------------------------------------------------
-#                      Processing helper functions
+#                      Processing helper functions (unchanged)
 # ------------------------------------------------------------------------------
 def apply_gain(array, gain_type, **kwargs):
     """Apply time-varying gain to radar data"""
@@ -1099,156 +1144,143 @@ if dzt_file and process_btn:
                 progress_bar.progress(40)
                 
                 # ----------------------
-                # READ DZT (self‑contained)
+                # READ DZT (new robust reader)
                 # ----------------------
-                header, arrays, gps = read_dzt(dzt_path, verbose=False)
+                result = read_dzt(dzt_path, verbose=False)
+                header = result['header']
+                data_channels = result['data']          # list of arrays (samples x traces)
+                depth_list_ns = result['depth']         # list of depth arrays (ns)
+                pos_array = result['pos']                # common position array
+                markers = result['markers']              # optional markers
 
                 progress_bar.progress(70)
                 
-                # Store original array
-                if arrays and len(arrays) > 0:
-                    original_array = arrays[0]
+                if data_channels and len(data_channels) > 0:
+                    # Store all channels
+                    st.session_state.original_arrays = data_channels
+                    st.session_state.depth_arrays_ns = depth_list_ns
+                    st.session_state.pos_array = pos_array
+                    st.session_state.n_channels = len(data_channels)
+                    st.session_state.channel_names = header.get('ANT', [''] * len(data_channels))
+                    st.session_state.header = header
+                    st.session_state.data_loaded = True
                     
-                    # Apply line reversal if requested
-                    if reverse_line:
-                        original_array = reverse_array(original_array)
-                        st.session_state.line_reversed = True
-                        st.info("✓ Line direction reversed (A→B to B→A)")
-                    else:
-                        st.session_state.line_reversed = False
+                    # Initialize processed arrays (will be filled after processing)
+                    processed_channels = []
                     
-                    # Store reversal state for later use
-                    st.session_state.reverse_line = reverse_line
-                    
-                    # Apply trace muting if requested
-                    if mute_traces:
-                        st.session_state.mute_applied = True
+                    # Process each channel (gain, muting, etc.)
+                    for ch_idx, orig_array in enumerate(data_channels):
+                        array = orig_array.copy()
                         
-                        # Prepare mute parameters
-                        mute_params = {
-                            'strength': mute_strength
-                        }
+                        # Apply line reversal if requested
+                        if reverse_line:
+                            array = reverse_array(array)
+                            st.session_state.line_reversed = True
+                        else:
+                            st.session_state.line_reversed = False
                         
-                        # Create distance axis for muting if needed
-                        mute_x_axis = None
-                        if coordinates_data is not None and use_coords_for_distance:
-                            mute_x_axis = coordinates_data['distance']
-                        elif not use_coords_for_distance and distance_unit != "traces":
-                            # Create linear distance axis
-                            mute_x_axis = np.linspace(0, total_distance, original_array.shape[1])
-                        
-                        if mute_method == "By Distance":
-                            mute_params.update({
-                                'method': 'By Distance',
-                                'start': mute_start_dist,
-                                'end': mute_end_dist,
-                                'apply_taper': apply_taper if 'apply_taper' in locals() else False,
-                                'taper_length': taper_length/100 if 'taper_length' in locals() else 0.1
-                            })
+                        # Apply trace muting if requested
+                        if mute_traces:
+                            st.session_state.mute_applied = True
                             
-                            # Apply muting
-                            muted_array, mute_mask = apply_trace_mute(
-                                original_array, mute_params, mute_x_axis, coordinates_data
+                            # Prepare mute parameters
+                            mute_params = {'strength': mute_strength}
+                            
+                            # Create distance axis for muting if needed
+                            mute_x_axis = None
+                            if coordinates_data is not None and use_coords_for_distance:
+                                mute_x_axis = coordinates_data['distance']
+                            elif not use_coords_for_distance and distance_unit != "traces":
+                                # Create linear distance axis using total_distance
+                                mute_x_axis = np.linspace(0, total_distance, array.shape[1])
+                            
+                            if mute_method == "By Distance":
+                                mute_params.update({
+                                    'method': 'By Distance',
+                                    'start': mute_start_dist,
+                                    'end': mute_end_dist,
+                                    'apply_taper': apply_taper if 'apply_taper' in locals() else False,
+                                    'taper_length': taper_length/100 if 'taper_length' in locals() else 0.1
+                                })
+                                array, mute_mask = apply_trace_mute(array, mute_params, mute_x_axis, coordinates_data)
+                                st.session_state.mute_mask = mute_mask
+                                st.session_state.mute_zones = [mute_params]
+                                
+                            elif mute_method == "By Trace Index":
+                                mute_params.update({
+                                    'method': 'By Trace Index',
+                                    'start': mute_start_idx,
+                                    'end': mute_end_idx,
+                                    'apply_taper': apply_taper if 'apply_taper' in locals() else False,
+                                    'taper_samples': taper_samples if 'taper_samples' in locals() else 10
+                                })
+                                array, mute_mask = apply_trace_mute(array, mute_params, mute_x_axis, coordinates_data)
+                                st.session_state.mute_mask = mute_mask
+                                st.session_state.mute_zones = [mute_params]
+                                
+                            elif mute_method == "Multiple Zones" and 'mute_zones' in locals():
+                                processed_zones = []
+                                for zone in mute_zones:
+                                    zone_params = {
+                                        'method': zone['method'],
+                                        'start': zone['start'],
+                                        'end': zone['end'],
+                                        'apply_taper': zone['taper'],
+                                        'label': zone['label']
+                                    }
+                                    processed_zones.append(zone_params)
+                                array, mute_mask = apply_multiple_mute_zones(array, processed_zones, mute_x_axis, coordinates_data)
+                                st.session_state.mute_mask = mute_mask
+                                st.session_state.mute_zones = processed_zones
+                            
+                            st.success(f"✓ Mute applied to channel {ch_idx+1}")
+                        else:
+                            st.session_state.mute_applied = False
+                            st.session_state.mute_mask = None
+                            st.session_state.mute_zones = None
+                        
+                        # Apply near-surface correction if requested
+                        if apply_near_surface_correction:
+                            st.session_state.near_surface_correction = True
+                            st.session_state.correction_type = correction_type
+                            st.session_state.correction_depth = correction_depth
+                            
+                            correction_params = {}
+                            if correction_type == "Linear Reduction":
+                                correction_params['surface_reduction'] = surface_reduction
+                                correction_params['depth_factor'] = depth_factor
+                            elif correction_type == "Exponential Reduction":
+                                correction_params['exp_factor'] = exp_factor
+                                correction_params['max_reduction'] = max_reduction
+                            elif correction_type == "Gaussian Filter":
+                                correction_params['filter_sigma'] = filter_sigma
+                                correction_params['filter_window'] = filter_window
+                            elif correction_type == "Windowed Normalization":
+                                correction_params['window_size'] = window_size
+                                correction_params['target_amplitude'] = target_amplitude
+                            
+                            array = apply_near_surface_correction(
+                                array, correction_type, correction_depth,
+                                max_depth if depth_unit != "samples" else None,
+                                **correction_params
                             )
-                            original_array = muted_array
-                            st.session_state.mute_mask = mute_mask
-                            st.session_state.mute_zones = [mute_params]
-                            
-                        elif mute_method == "By Trace Index":
-                            mute_params.update({
-                                'method': 'By Trace Index',
-                                'start': mute_start_idx,
-                                'end': mute_end_idx,
-                                'apply_taper': apply_taper if 'apply_taper' in locals() else False,
-                                'taper_samples': taper_samples if 'taper_samples' in locals() else 10
-                            })
-                            
-                            # Apply muting
-                            muted_array, mute_mask = apply_trace_mute(
-                                original_array, mute_params, mute_x_axis, coordinates_data
-                            )
-                            original_array = muted_array
-                            st.session_state.mute_mask = mute_mask
-                            st.session_state.mute_zones = [mute_params]
-                            
-                        elif mute_method == "Multiple Zones":
-                            # Convert mute_zones to proper format
-                            processed_zones = []
-                            for zone in mute_zones:
-                                zone_params = {
-                                    'method': zone['method'],
-                                    'start': zone['start'],
-                                    'end': zone['end'],
-                                    'apply_taper': zone['taper'],
-                                    'label': zone['label']
-                                }
-                                processed_zones.append(zone_params)
-                            
-                            # Apply multiple mute zones
-                            muted_array, mute_mask = apply_multiple_mute_zones(
-                                original_array, processed_zones, mute_x_axis, coordinates_data
-                            )
-                            original_array = muted_array
-                            st.session_state.mute_mask = mute_mask
-                            st.session_state.mute_zones = processed_zones
                         
-                        st.success(f"✓ {len(st.session_state.mute_zones) if mute_method == 'Multiple Zones' else 1} mute zone(s) applied")
-                    else:
-                        st.session_state.mute_applied = False
-                        st.session_state.mute_mask = None
-                        st.session_state.mute_zones = None
-                    
-                    # Apply near-surface correction if requested
-                    if apply_near_surface_correction:
-                        # Store correction parameters
-                        st.session_state.near_surface_correction = True
-                        st.session_state.correction_type = correction_type
-                        st.session_state.correction_depth = correction_depth
+                        # Apply time-varying gain
+                        if gain_type == "Constant":
+                            array = apply_gain(array, "Constant", const_gain=const_gain)
+                        elif gain_type == "Linear":
+                            array = apply_gain(array, "Linear", min_gain=min_gain, max_gain=max_gain)
+                        elif gain_type == "Exponential":
+                            array = apply_gain(array, "Exponential", base_gain=base_gain, exp_factor=exp_factor)
+                        elif gain_type == "AGC (Automatic Gain Control)":
+                            array = apply_gain(array, "AGC (Automatic Gain Control)",
+                                              window_size=window_size, target_amplitude=target_amplitude)
+                        elif gain_type == "Spherical":
+                            array = apply_gain(array, "Spherical", power_gain=power_gain, attenuation=attenuation)
                         
-                        # Prepare correction parameters dictionary
-                        correction_params = {}
-                        if correction_type == "Linear Reduction":
-                            correction_params['surface_reduction'] = surface_reduction
-                            correction_params['depth_factor'] = depth_factor
-                        elif correction_type == "Exponential Reduction":
-                            correction_params['exp_factor'] = exp_factor
-                            correction_params['max_reduction'] = max_reduction
-                        elif correction_type == "Gaussian Filter":
-                            correction_params['filter_sigma'] = filter_sigma
-                            correction_params['filter_window'] = filter_window
-                        elif correction_type == "Windowed Normalization":
-                            correction_params['window_size'] = window_size
-                            correction_params['target_amplitude'] = target_amplitude
-                        
-                        # Apply the correction
-                        original_array = apply_near_surface_correction(
-                            original_array, 
-                            correction_type, 
-                            correction_depth, 
-                            max_depth if depth_unit != "samples" else None,
-                            **correction_params
-                        )
+                        processed_channels.append(array)
                     
-                    # Apply time-varying gain
-                    processed_array = original_array.copy()
-                    
-                    # Apply selected gain
-                    if gain_type == "Constant":
-                        processed_array = apply_gain(processed_array, "Constant", 
-                                                    const_gain=const_gain)
-                    elif gain_type == "Linear":
-                        processed_array = apply_gain(processed_array, "Linear",
-                                                    min_gain=min_gain, max_gain=max_gain)
-                    elif gain_type == "Exponential":
-                        processed_array = apply_gain(processed_array, "Exponential",
-                                                    base_gain=base_gain, exp_factor=exp_factor)
-                    elif gain_type == "AGC (Automatic Gain Control)":
-                        processed_array = apply_gain(processed_array, "AGC (Automatic Gain Control)",
-                                                    window_size=window_size, target_amplitude=target_amplitude)
-                    elif gain_type == "Spherical":
-                        processed_array = apply_gain(processed_array, "Spherical",
-                                                    power_gain=power_gain, attenuation=attenuation)
-                    
+                    st.session_state.processed_arrays = processed_channels
                     progress_bar.progress(80)
                     
                     # Process coordinates if provided
@@ -1256,7 +1288,7 @@ if dzt_file and process_btn:
                         try:
                             coordinates_data = process_coordinates(
                                 st.session_state.coordinates,
-                                processed_array.shape[1],
+                                processed_channels[0].shape[1],  # number of traces (same for all channels)
                                 trace_col=trace_col if 'trace_col' in locals() else None,
                                 method=interp_method.lower() if 'interp_method' in locals() else 'linear'
                             )
@@ -1268,26 +1300,15 @@ if dzt_file and process_btn:
                     
                     progress_bar.progress(90)
                     
-                    # Store in session state
-                    st.session_state.header = header
-                    st.session_state.original_array = original_array
-                    st.session_state.processed_array = processed_array
-                    st.session_state.gps = gps
-                    st.session_state.data_loaded = True
-                    
                     # Store axis scaling parameters
                     st.session_state.depth_unit = depth_unit
                     st.session_state.max_depth = max_depth if depth_unit != "samples" else None
-                    
-                    # Store coordinate usage
-                    st.session_state.use_coords_for_distance = 'use_coords_for_distance' in locals() and use_coords_for_distance
-                    st.session_state.coordinates_data = coordinates_data
-                    
-                    if not st.session_state.use_coords_for_distance:
+                    st.session_state.use_coords_for_distance = use_coords_for_distance
+                    if not use_coords_for_distance:
                         st.session_state.distance_unit = distance_unit
                         st.session_state.total_distance = total_distance if distance_unit != "traces" else None
                     else:
-                        st.session_state.distance_unit = "meters"  # Default for coordinates
+                        st.session_state.distance_unit = "meters"
                         st.session_state.total_distance = coordinates_data['distance'][-1] if coordinates_data else None
                     
                     # Store aspect ratio
@@ -1304,7 +1325,7 @@ if dzt_file and process_btn:
                     if use_custom_window:
                         st.session_state.depth_min = depth_min if 'depth_min' in locals() else 0
                         st.session_state.depth_max = depth_max if 'depth_max' in locals() else max_depth
-                        if not st.session_state.use_coords_for_distance:
+                        if not use_coords_for_distance:
                             st.session_state.distance_min = distance_min if 'distance_min' in locals() else 0
                             st.session_state.distance_max = distance_max if 'distance_max' in locals() else total_distance
                     
@@ -1328,6 +1349,18 @@ if dzt_file and process_btn:
 #                           Display results (tabs)
 # ------------------------------------------------------------------------------
 if st.session_state.data_loaded:
+    # Ensure selected channel is within bounds
+    ch = st.session_state.selected_channel
+    if ch >= st.session_state.n_channels:
+        ch = 0
+        st.session_state.selected_channel = 0
+    
+    # Get current channel data
+    orig_array = st.session_state.original_arrays[ch]
+    proc_array = st.session_state.processed_arrays[ch]
+    depth_ns = st.session_state.depth_arrays_ns[ch]   # depth in ns
+    pos = st.session_state.pos_array
+    
     # Create tabs
     tab_names = ["📊 Header Info", "📈 Full View", "🔍 Custom Window", "🗺️ Coordinate View", "📉 FFT Analysis", "🎛️ Gain Analysis", "💾 Export"]
     tabs = st.tabs(tab_names)
@@ -1405,29 +1438,34 @@ if st.session_state.data_loaded:
         with col2:
             if st.session_state.header:
                 st.markdown("### File Header")
+                # Convert header to a more display-friendly dict
+                h = st.session_state.header
                 info_data = {
-                    "System": st.session_state.header.get('system', 'Unknown'),
-                    "Antenna Frequency": f"{st.session_state.header.get('ant_freq', 'N/A')} MHz",
-                    "Samples per Trace": st.session_state.header.get('spt', 'N/A'),
-                    "Number of Traces": st.session_state.header.get('ntraces', 'N/A')
+                    "Samples per trace": h.get('NSAMP', 'N/A'),
+                    "Number of traces": proc_array.shape[1],
+                    "Bits per sample": h.get('BITS', 'N/A'),
+                    "Time window (ns)": f"{h.get('RANGE', 'N/A'):.2f}",
+                    "Scans per meter": f"{h.get('SPM', 'N/A'):.3f}",
+                    "Number of channels": st.session_state.n_channels,
+                    "Antenna names": ", ".join(st.session_state.channel_names)
                 }
                 
                 for key, value in info_data.items():
                     st.markdown(f"**{key}:** {value}")
     
     with tabs[1]:  # Full View
-        st.subheader("Full Radar Profile")
+        st.subheader(f"Full Radar Profile - Channel {ch+1}")
         
         # Determine aspect ratio
         aspect_value = get_aspect_ratio(
             st.session_state.aspect_mode,
             st.session_state.aspect_ratio,
-            st.session_state.processed_array.shape
+            proc_array.shape
         )
         
-        # Create scaled axes for full view
+        # Create scaled axes for full view using the current channel's shape
         x_axis_full, y_axis_full, x_label_full, y_label_full, _, _ = scale_axes(
-            st.session_state.processed_array.shape,
+            proc_array.shape,
             st.session_state.depth_unit,
             st.session_state.max_depth if hasattr(st.session_state, 'max_depth') else None,
             st.session_state.distance_unit,
@@ -1457,12 +1495,12 @@ if st.session_state.data_loaded:
         
         # Plot original full view
         if normalize_colors:
-            vmax_plot = np.percentile(np.abs(st.session_state.original_array), 99)
+            vmax_plot = np.percentile(np.abs(orig_array), 99)
             vmin_plot = -vmax_plot
         else:
             vmin_plot, vmax_plot = vmin, vmax
         
-        im1 = ax1_full.imshow(st.session_state.original_array, 
+        im1 = ax1_full.imshow(orig_array, 
                              extent=[x_axis_full[0], x_axis_full[-1], y_axis_full[-1], y_axis_full[0]],
                              aspect=aspect_display, cmap=colormap, 
                              vmin=vmin_plot, vmax=vmax_plot,
@@ -1470,14 +1508,14 @@ if st.session_state.data_loaded:
         
         ax1_full.set_xlabel(x_label_full)
         ax1_full.set_ylabel(y_label_full)
-        ax1_full.set_title("Original Data - Full View")
+        ax1_full.set_title(f"Original Data - Channel {ch+1} - Full View")
         ax1_full.grid(True, alpha=0.3, linestyle='--')
         
         if show_colorbar:
             plt.colorbar(im1, ax=ax1_full, label='Amplitude')
         
         # Plot processed full view
-        im2 = ax2_full.imshow(st.session_state.processed_array,
+        im2 = ax2_full.imshow(proc_array,
                              extent=[x_axis_full[0], x_axis_full[-1], y_axis_full[-1], y_axis_full[0]],
                              aspect=aspect_display, cmap=colormap,
                              vmin=vmin_plot, vmax=vmax_plot,
@@ -1485,7 +1523,7 @@ if st.session_state.data_loaded:
         
         ax2_full.set_xlabel(x_label_full)
         ax2_full.set_ylabel(y_label_full)
-        ax2_full.set_title(f"Processed ({gain_type} Gain) - Full View")
+        ax2_full.set_title(f"Processed ({gain_type} Gain) - Channel {ch+1} - Full View")
         ax2_full.grid(True, alpha=0.3, linestyle='--')
         
         if show_colorbar:
@@ -1493,7 +1531,7 @@ if st.session_state.data_loaded:
         
         # Add mute zone visualization if applied
         if hasattr(st.session_state, 'mute_applied') and st.session_state.mute_applied:
-            if hasattr(st.session_state, 'mute_mask'):
+            if hasattr(st.session_state, 'mute_mask') and st.session_state.mute_mask is not None:
                 # Create a transparent red colormap for mute zones
                 mute_cmap = ListedColormap([(1, 0, 0, 0.3)])  # Red with 30% opacity
                 
@@ -1516,7 +1554,7 @@ if st.session_state.data_loaded:
         st.pyplot(fig_full)
         
         # Display aspect ratio info
-        st.info(f"**Aspect Ratio:** {aspect_value} | **Plot Dimensions:** {st.session_state.processed_array.shape[1]} × {st.session_state.processed_array.shape[0]} | **Y:X Scale:** {y_axis_full[-1]/x_axis_full[-1]:.3f}")
+        st.info(f"**Aspect Ratio:** {aspect_value} | **Plot Dimensions:** {proc_array.shape[1]} × {proc_array.shape[0]} | **Y:X Scale:** {y_axis_full[-1]/x_axis_full[-1]:.3f}")
     
     with tabs[2]:  # Custom Window
         st.subheader("Custom Window Analysis")
@@ -1526,7 +1564,7 @@ if st.session_state.data_loaded:
         else:
             # Create scaled axes
             x_axis, y_axis, x_label, y_label, _, _ = scale_axes(
-                st.session_state.processed_array.shape,
+                proc_array.shape,
                 st.session_state.depth_unit,
                 st.session_state.max_depth if hasattr(st.session_state, 'max_depth') else None,
                 st.session_state.distance_unit,
@@ -1542,12 +1580,12 @@ if st.session_state.data_loaded:
             )
             
             # Extract windowed data
-            window_data = st.session_state.processed_array[
+            window_data = proc_array[
                 window_info['depth_min_idx']:window_info['depth_max_idx'],
                 window_info['dist_min_idx']:window_info['dist_max_idx']
             ]
             
-            window_data_original = st.session_state.original_array[
+            window_data_original = orig_array[
                 window_info['depth_min_idx']:window_info['depth_max_idx'],
                 window_info['dist_min_idx']:window_info['dist_max_idx']
             ]
@@ -1663,7 +1701,7 @@ if st.session_state.data_loaded:
                         )
                         
                         # Extract window data
-                        win_data = st.session_state.processed_array[
+                        win_data = proc_array[
                             win_info['depth_min_idx']:win_info['depth_max_idx'],
                             win_info['dist_min_idx']:win_info['dist_max_idx']
                         ]
@@ -1789,9 +1827,9 @@ if st.session_state.data_loaded:
             
             with col2:
                 st.metric("Easting Range", 
-                         f"{np.ptp(st.session_state.interpolated_coords['easting']):.1f} m")
+                         f"{st.session_state.interpolated_coords['easting'].ptp():.1f} m")
                 st.metric("Northing Range", 
-                         f"{np.ptp(st.session_state.interpolated_coords['northing']):.1f} m")
+                         f"{st.session_state.interpolated_coords['northing'].ptp():.1f} m")
             
             with col3:
                 avg_spacing = np.mean(np.diff(st.session_state.interpolated_coords['distance']))
@@ -1859,24 +1897,27 @@ if st.session_state.data_loaded:
             aspect_value_coords = get_aspect_ratio(
                 st.session_state.aspect_mode,
                 st.session_state.aspect_ratio,
-                st.session_state.processed_array.shape
+                proc_array.shape
             )
             
-            # Create depth axis
-            if st.session_state.depth_unit != "samples":
-                depth_axis = np.linspace(0, st.session_state.max_depth, 
-                                        st.session_state.processed_array.shape[0])
-            else:
-                depth_axis = np.arange(st.session_state.processed_array.shape[0])
+            # Create depth axis using current channel's depth in ns (convert if needed)
+            # For display, we use the scaled y_axis (same as full view)
+            x_axis_coord, y_axis_coord, x_label_coord, y_label_coord, _, _ = scale_axes(
+                proc_array.shape,
+                st.session_state.depth_unit,
+                st.session_state.max_depth if hasattr(st.session_state, 'max_depth') else None,
+                st.session_state.distance_unit,
+                st.session_state.total_distance if hasattr(st.session_state, 'total_distance') else None,
+                coordinates=st.session_state.interpolated_coords  # use coordinates for x
+            )
             
             # Plot GPR data with coordinate-based distance
-            im = ax4.imshow(st.session_state.processed_array,
-                          extent=[st.session_state.interpolated_coords['distance'][0],
-                                 st.session_state.interpolated_coords['distance'][  -1],
-                                 depth_axis[-1], depth_axis[0]],
+            im = ax4.imshow(proc_array,
+                          extent=[x_axis_coord[0], x_axis_coord[-1],
+                                  y_axis_coord[-1], y_axis_coord[0]],
                           aspect=aspect_value_coords, cmap='seismic', alpha=0.9)
-            ax4.set_xlabel('Distance along profile (m)')
-            ax4.set_ylabel(f'Depth ({st.session_state.depth_unit})')
+            ax4.set_xlabel(x_label_coord)
+            ax4.set_ylabel(y_label_coord)
             ax4.set_title(f'GPR Data with Coordinate Scaling (Aspect: {aspect_value_coords})')
             ax4.grid(True, alpha=0.2)
             plt.colorbar(im, ax=ax4, label='Amplitude')
@@ -1895,43 +1936,54 @@ if st.session_state.data_loaded:
             # Coordinate-based GPR with elevation adjustment
             st.subheader("Elevation-Adjusted GPR Display")
             
-            # Calculate elevation-adjusted depth
-            n_traces = st.session_state.processed_array.shape[1]
-            n_samples = st.session_state.processed_array.shape[0]
+            # For elevation adjustment, we need the actual depth in meters.
+            # If depth_unit is not meters, convert using user settings.
+            if st.session_state.depth_unit == "meters":
+                depth_m = y_axis_coord  # already in meters
+            elif st.session_state.depth_unit == "nanoseconds" and velocity is not None:
+                # Convert ns to meters: depth (m) = time (ns) * velocity (m/ns) / 2
+                depth_m = y_axis_coord * velocity / 2.0
+            else:
+                st.warning("Cannot create elevation-adjusted plot: depth unit not meters or velocity not set.")
+                depth_m = None
             
-            # Create meshgrid for pcolormesh
-            X, Y = np.meshgrid(st.session_state.interpolated_coords['distance'], depth_axis)
-            
-            # Adjust Y coordinates by elevation (convert depth to elevation)
-            Y_elev = np.zeros_like(Y)
-            for i in range(n_traces):
-                Y_elev[:, i] = st.session_state.interpolated_coords['elevation'][i] - depth_axis
-            
-            fig_elev, ax_elev = plt.subplots(figsize=(14, 6))
-            
-            # Use pcolormesh for elevation-adjusted display
-            mesh = ax_elev.pcolormesh(X, Y_elev, st.session_state.processed_array,
-                                     cmap='seismic', shading='auto', alpha=0.9)
-            
-            ax_elev.set_xlabel('Distance along profile (m)')
-            ax_elev.set_ylabel('Elevation (m)')
-            ax_elev.set_title('GPR Data with Elevation Adjustment')
-            ax_elev.grid(True, alpha=0.2)
-            plt.colorbar(mesh, ax=ax_elev, label='Amplitude')
-            
-            # Add topographic surface line
-            ax_elev.plot(st.session_state.interpolated_coords['distance'],
-                        st.session_state.interpolated_coords['elevation'],
-                        'k-', linewidth=2, alpha=0.8, label='Surface')
-            ax_elev.fill_between(st.session_state.interpolated_coords['distance'],
-                                Y_elev.min(), st.session_state.interpolated_coords['elevation'],
-                                alpha=0.1, color='gray')
-            
-            ax_elev.legend()
-            ax_elev.set_ylim(Y_elev.min(), st.session_state.interpolated_coords['elevation'].max() + 5)
-            
-            plt.tight_layout()
-            st.pyplot(fig_elev)
+            if depth_m is not None:
+                n_traces = proc_array.shape[1]
+                n_samples = proc_array.shape[0]
+                
+                # Create meshgrid for pcolormesh
+                X, Y = np.meshgrid(st.session_state.interpolated_coords['distance'], depth_m)
+                
+                # Adjust Y coordinates by elevation (convert depth to elevation)
+                Y_elev = np.zeros_like(Y)
+                for i in range(n_traces):
+                    Y_elev[:, i] = st.session_state.interpolated_coords['elevation'][i] - depth_m
+                
+                fig_elev, ax_elev = plt.subplots(figsize=(14, 6))
+                
+                # Use pcolormesh for elevation-adjusted display
+                mesh = ax_elev.pcolormesh(X, Y_elev, proc_array,
+                                         cmap='seismic', shading='auto', alpha=0.9)
+                
+                ax_elev.set_xlabel('Distance along profile (m)')
+                ax_elev.set_ylabel('Elevation (m)')
+                ax_elev.set_title('GPR Data with Elevation Adjustment')
+                ax_elev.grid(True, alpha=0.2)
+                plt.colorbar(mesh, ax=ax_elev, label='Amplitude')
+                
+                # Add topographic surface line
+                ax_elev.plot(st.session_state.interpolated_coords['distance'],
+                            st.session_state.interpolated_coords['elevation'],
+                            'k-', linewidth=2, alpha=0.8, label='Surface')
+                ax_elev.fill_between(st.session_state.interpolated_coords['distance'],
+                                    Y_elev.min(), st.session_state.interpolated_coords['elevation'],
+                                    alpha=0.1, color='gray')
+                
+                ax_elev.legend()
+                ax_elev.set_ylim(Y_elev.min(), st.session_state.interpolated_coords['elevation'].max() + 5)
+                
+                plt.tight_layout()
+                st.pyplot(fig_elev)
             
             # Export coordinates
             st.subheader("Export Interpolated Coordinates")
@@ -1961,8 +2013,8 @@ if st.session_state.data_loaded:
         
         with col1:
             trace_for_fft = st.slider("Select Trace for FFT", 
-                                     0, st.session_state.processed_array.shape[1]-1, 
-                                     st.session_state.processed_array.shape[1]//2,
+                                     0, proc_array.shape[1]-1, 
+                                     proc_array.shape[1]//2,
                                      key="fft_trace")
         
         with col2:
@@ -1975,32 +2027,32 @@ if st.session_state.data_loaded:
                                    key="fft_mode")
         
         if fft_mode == "Trace Range":
-            trace_start = st.number_input("Start Trace", 0, st.session_state.processed_array.shape[1]-1, 0,
+            trace_start = st.number_input("Start Trace", 0, proc_array.shape[1]-1, 0,
                                          key="fft_start")
-            trace_end = st.number_input("End Trace", 0, st.session_state.processed_array.shape[1]-1, 
-                                       st.session_state.processed_array.shape[1]-1,
+            trace_end = st.number_input("End Trace", 0, proc_array.shape[1]-1, 
+                                       proc_array.shape[1]-1,
                                        key="fft_end")
         
         # Calculate FFT
         if fft_mode == "Single Trace":
-            trace_data = st.session_state.processed_array[:, trace_for_fft]
+            trace_data = proc_array[:, trace_for_fft]
             freq, amplitude = calculate_fft(trace_data, sampling_rate)
             title = f"FFT - Trace {trace_for_fft}"
         
         elif fft_mode == "Average of All Traces":
-            avg_trace = np.mean(st.session_state.processed_array, axis=1)
+            avg_trace = np.mean(proc_array, axis=1)
             freq, amplitude = calculate_fft(avg_trace, sampling_rate)
             title = "FFT - Average of All Traces"
         
         elif fft_mode == "Trace Range":
-            avg_trace = np.mean(st.session_state.processed_array[:, trace_start:trace_end+1], axis=1)
+            avg_trace = np.mean(proc_array[:, trace_start:trace_end+1], axis=1)
             freq, amplitude = calculate_fft(avg_trace, sampling_rate)
             title = f"FFT - Traces {trace_start} to {trace_end}"
         
         elif fft_mode == "Windowed Traces" and st.session_state.use_custom_window:
             # Create scaled axes to get window indices
             x_axis, y_axis, _, _, _, _ = scale_axes(
-                st.session_state.processed_array.shape,
+                proc_array.shape,
                 st.session_state.depth_unit,
                 st.session_state.max_depth if hasattr(st.session_state, 'max_depth') else None,
                 st.session_state.distance_unit,
@@ -2016,7 +2068,7 @@ if st.session_state.data_loaded:
             )
             
             # Use windowed traces
-            windowed_traces = st.session_state.processed_array[
+            windowed_traces = proc_array[
                 :, window_info['dist_min_idx']:window_info['dist_max_idx']
             ]
             avg_trace = np.mean(windowed_traces, axis=1)
@@ -2093,13 +2145,13 @@ if st.session_state.data_loaded:
         st.subheader("Gain Analysis")
         
         # Calculate gain profile
-        n_samples = st.session_state.original_array.shape[0]
+        n_samples = orig_array.shape[0]
         
         with np.errstate(divide='ignore', invalid='ignore'):
             gain_profile = np.zeros(n_samples)
             for i in range(n_samples):
-                orig_slice = st.session_state.original_array[i, :]
-                proc_slice = st.session_state.processed_array[i, :]
+                orig_slice = orig_array[i, :]
+                proc_slice = proc_array[i, :]
                 
                 mask = np.abs(orig_slice) > 1e-10
                 if np.any(mask):
@@ -2153,7 +2205,7 @@ if st.session_state.data_loaded:
                 fig, ax = plt.subplots(figsize=(12, 8))
                 
                 x_axis_export, y_axis_export, x_label_export, y_label_export, _, _ = scale_axes(
-                    st.session_state.processed_array.shape,
+                    proc_array.shape,
                     st.session_state.depth_unit,
                     st.session_state.max_depth if hasattr(st.session_state, 'max_depth') else None,
                     st.session_state.distance_unit,
@@ -2161,13 +2213,13 @@ if st.session_state.data_loaded:
                     coordinates=st.session_state.interpolated_coords if st.session_state.use_coords_for_distance else None
                 )
                 
-                im = ax.imshow(st.session_state.processed_array,
+                im = ax.imshow(proc_array,
                              extent=[x_axis_export[0], x_axis_export[-1], 
                                     y_axis_export[-1], y_axis_export[0]],
                              aspect='auto', cmap='seismic')
                 ax.set_xlabel(x_label_export)
                 ax.set_ylabel(y_label_export)
-                ax.set_title(f"GPR Data - {gain_type} Gain")
+                ax.set_title(f"GPR Data - Channel {ch+1} - {gain_type} Gain")
                 plt.colorbar(im, ax=ax, label='Amplitude')
                 plt.tight_layout()
                 plt.savefig("gpr_data_full.png", dpi=300, bbox_inches='tight')
@@ -2180,7 +2232,7 @@ if st.session_state.data_loaded:
                     
                     # Create scaled axes
                     x_axis, y_axis, x_label, y_label, _, _ = scale_axes(
-                        st.session_state.processed_array.shape,
+                        proc_array.shape,
                         st.session_state.depth_unit,
                         st.session_state.max_depth if hasattr(st.session_state, 'max_depth') else None,
                         st.session_state.distance_unit,
@@ -2194,7 +2246,7 @@ if st.session_state.data_loaded:
                         st.session_state.distance_min, st.session_state.distance_max
                     )
                     
-                    window_data = st.session_state.processed_array[
+                    window_data = proc_array[
                         window_info['depth_min_idx']:window_info['depth_max_idx'],
                         window_info['dist_min_idx']:window_info['dist_max_idx']
                     ]
@@ -2219,7 +2271,7 @@ if st.session_state.data_loaded:
         with col3:
             # Export as CSV with scaled axes
             x_axis_csv, _, _, _, _, _ = scale_axes(
-                st.session_state.processed_array.shape,
+                proc_array.shape,
                 st.session_state.depth_unit,
                 st.session_state.max_depth if hasattr(st.session_state, 'max_depth') else None,
                 st.session_state.distance_unit,
@@ -2227,7 +2279,7 @@ if st.session_state.data_loaded:
                 coordinates=st.session_state.interpolated_coords if st.session_state.use_coords_for_distance else None
             )
             
-            csv_data = pd.DataFrame(st.session_state.processed_array, 
+            csv_data = pd.DataFrame(proc_array, 
                                   columns=[f"{xi:.2f}" for xi in x_axis_csv])
             csv_string = csv_data.to_csv(index=False)
             
@@ -2243,7 +2295,7 @@ if st.session_state.data_loaded:
             if st.session_state.use_custom_window:
                 # Export windowed data
                 x_axis, y_axis, x_label, y_label, _, _ = scale_axes(
-                    st.session_state.processed_array.shape,
+                    proc_array.shape,
                     st.session_state.depth_unit,
                     st.session_state.max_depth if hasattr(st.session_state, 'max_depth') else None,
                     st.session_state.distance_unit,
@@ -2257,7 +2309,7 @@ if st.session_state.data_loaded:
                     st.session_state.distance_min, st.session_state.distance_max
                 )
                 
-                window_data = st.session_state.processed_array[
+                window_data = proc_array[
                     window_info['depth_min_idx']:window_info['depth_max_idx'],
                     window_info['dist_min_idx']:window_info['dist_max_idx']
                 ]
@@ -2357,9 +2409,3 @@ st.markdown(
     "</div>",
     unsafe_allow_html=True
 )
-
-
-
-
-
-
