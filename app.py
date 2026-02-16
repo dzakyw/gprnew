@@ -501,7 +501,10 @@ def read_dzt(filepath, verbose=False):
         elif header.bits == 8:
             dtype = np.int8
         else:
-            raise ValueError(f"Unsupported bit depth: {header.bits}")
+            else:
+            st.warning(f"Unsupported bit depth {header.bits}. Attempting to read as 16‑bit (most common).")
+            dtype = np.int32
+            header.bits = 32   # override
 
         # --------------------------------------------------
         # 3. Read full data block
@@ -2355,5 +2358,6 @@ st.markdown(
     "</div>",
     unsafe_allow_html=True
 )
+
 
 
