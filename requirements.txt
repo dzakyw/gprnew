@@ -4,8 +4,7 @@ numpy
 pandas
 matplotlib
 scipy
-readgssi
-h5py
+git+https://github.com/iannesbitt/readgssi.gith5py
 pynmea2
 geopy
 pytz
