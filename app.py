@@ -1445,11 +1445,9 @@ if dzt_file and process_btn:
             # Try to import readgssi
             try:
                 from readgssi import readgssi
-                pip install ~/readgssi
             except ImportError:
                 st.error("⚠️ readgssi not installed! Please run:")
-                st.code("pip install readgssi")
-                st.stop()
+                
             
             # Create progress bar
             progress_bar = st.progress(0)
@@ -3294,6 +3292,7 @@ st.markdown(
     "</div>",
     unsafe_allow_html=True
 )
+
 
 
 
