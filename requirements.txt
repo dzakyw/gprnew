@@ -1,6 +1,12 @@
+setuptools = 81.0.0
 streamlit
 numpy
 pandas
 matplotlib
 scipy
 readgssi
+h5py
+pynmea2
+geopy
+pytz
+obspy
