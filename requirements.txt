@@ -1,5 +1,5 @@
 streamlit
-pip==26.0.1
+readgssi
 numpy
 pandas
 matplotlib
