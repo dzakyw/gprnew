@@ -13,4 +13,3 @@ git+https://github.com/iannesbitt/readgssi.git#egg=readgssi
 pytz
 obspy
 h5py
-setuptools
