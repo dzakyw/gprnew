@@ -6,7 +6,6 @@ import sys
 from pathlib import Path
 import PIL.Image
 from readgssi import readgssi
-import pkg_resources
 st.set_page_config(page_title="readgssi GPR Viewer", layout="wide")
 st.title("🛰️ readgssi GPR Data Viewer")
 st.markdown("Upload a GSSI GPR (`.dzt`) file to view a basic radargram and metadata.")
@@ -140,5 +139,6 @@ with st.sidebar.expander("ℹ️ How to use"):
 
     **Note:** This is a basic interface. For full `readgssi` capabilities, use the command line.
     """)
+
 
 
