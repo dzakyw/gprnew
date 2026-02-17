@@ -2,6 +2,7 @@ import streamlit as st
 import subprocess
 import tempfile
 import os
+import sys
 from pathlib import Path
 import PIL.Image
 
@@ -9,17 +10,24 @@ st.set_page_config(page_title="readgssi GPR Viewer", layout="wide")
 st.title("🛰️ readgssi GPR Data Viewer")
 st.markdown("Upload a GSSI GPR (`.dzt`) file to view a basic radargram and metadata.")
 
-# --- Check if readgssi is available ---
+# --- Check if readgssi module is available ---
 def check_readgssi():
     try:
-        result = subprocess.run(["readgssi", "-V"], capture_output=True, text=True, check=True)
+        # Use python -m readgssi to ensure we use the current environment's interpreter
+        result = subprocess.run(
+            [sys.executable, "-m", "readgssi", "-V"],
+            capture_output=True, text=True, check=True
+        )
         return True, result.stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError, ImportError):
         return False, None
 
 is_available, version_info = check_readgssi()
 if not is_available:
-    st.error("`readgssi` command not found. Please ensure it is installed in the environment (see `requirements.txt`).")
+    st.error(
+        "`readgssi` module not found. Please ensure it is installed in the current Python environment:\n"
+        "```bash\npip install readgssi\n```"
+    )
     st.stop()
 else:
     st.sidebar.success(f"✅ readgssi {version_info}")
@@ -58,9 +66,9 @@ if uploaded_file is not None:
         output_image = Path(output_dir) / "radargram.png"
         output_meta = Path(output_dir) / "metadata.txt"
 
-        # Build the readgssi command
+        # Build the readgssi command using python -m readgssi
         cmd = [
-            "readgssi",
+            sys.executable, "-m", "readgssi",
             "-i", input_path,
             "-o", str(output_image),
             "-gz", gain,
@@ -124,7 +132,7 @@ else:
 # --- Usage instructions ---
 with st.sidebar.expander("ℹ️ How to use"):
     st.markdown("""
-    1.  Ensure `readgssi` is installed (`pip install -r requirements.txt`).
+    1.  Ensure `readgssi` is installed (`pip install readgssi`).
     2.  Upload a GSSI `.dzt` file.
     3.  Adjust processing options on the left.
     4.  The radargram image and metadata will appear automatically.
