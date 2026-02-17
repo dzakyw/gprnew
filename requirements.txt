@@ -4,6 +4,8 @@ numpy
 pandas
 matplotlib
 scipy
+setuptools>=65.0.0  # Explicit version
+wheel  # Often needed with setuptools
 geographiclib==1.49
 geopy==1.18.1
 git+https://github.com/Knio/pynmea2.git
