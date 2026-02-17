@@ -623,12 +623,14 @@ with st.sidebar:
     
     freq_filter = st.checkbox("Apply Frequency Filter", False)
     if freq_filter:
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             freq_min = st.number_input("Min Freq (MHz)", 10, 500, 60)
         with col2:
             freq_max = st.number_input("Max Freq (MHz)", 10, 1000, 130)
-    
+        with col3:
+            sampling_rate = st.number_input("Sampling Rate (MHz)", 100, 5000, 1000, 100,
+                                            help="Antenna sampling rate in MHz")
     process_btn = st.button("🚀 Process Data", type="primary", use_container_width=True)
 
 # Helper functions for deconvolution
@@ -1601,16 +1603,27 @@ if csv_file and process_btn:   # <-- CHANGED from dzt_file to csv_file
             progress_bar.progress(60)
 
             # ---------- NEW: Apply frequency filtering ----------
+                        # ---------- NEW: Apply frequency filtering ----------
             if freq_filter:
                 from scipy import signal as scipy_signal
-                # Design a Butterworth bandpass filter
-                # (You may adjust the filter order and type as needed)
-                sos = scipy_signal.butter(4, [freq_min, freq_max], btype='band', fs=freq_max*2, output='sos')
-                filtered = np.zeros_like(original_array)
-                for i in range(n_traces):
-                    filtered[:, i] = scipy_signal.sosfiltfilt(sos, original_array[:, i])
-                original_array = filtered
-                st.info(f"✓ Applied frequency filter: {freq_min}-{freq_max} MHz")
+                # Check that freq_max <= Nyquist frequency
+                nyquist = sampling_rate / 2.0
+                if freq_max > nyquist:
+                    st.warning(f"freq_max ({freq_max} MHz) exceeds Nyquist frequency ({nyquist} MHz). Adjusting to Nyquist.")
+                    freq_max = nyquist
+                if freq_min >= freq_max:
+                    st.error("freq_min must be less than freq_max. Skipping filter.")
+                else:
+                    # Normalize frequencies to Nyquist
+                    low = freq_min / nyquist
+                    high = freq_max / nyquist
+                    # Design a 4th order Butterworth bandpass filter
+                    sos = scipy_signal.butter(4, [low, high], btype='band', output='sos')
+                    filtered = np.zeros_like(original_array)
+                    for i in range(n_traces):
+                        filtered[:, i] = scipy_signal.sosfiltfilt(sos, original_array[:, i])
+                    original_array = filtered
+                    st.info(f"✓ Applied frequency filter: {freq_min}-{freq_max} MHz (sampling rate: {sampling_rate} MHz)")
 
             progress_bar.progress(70)
 
@@ -3266,6 +3279,7 @@ st.markdown(
     "</div>",
     unsafe_allow_html=True
 )
+
 
 
 
