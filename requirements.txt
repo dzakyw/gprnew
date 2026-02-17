@@ -6,7 +6,7 @@ matplotlib
 scipy
 geographiclib==1.49
 geopy==1.18.1
-pynmea2==1.12.0
+git+https://github.com/Knio/pynmea2.git
 git+https://github.com/iannesbitt/readgssi.git#egg=readgssi
 pytz
 obspy
