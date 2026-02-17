@@ -19,14 +19,6 @@ from scipy.interpolate import interp1d, griddata
 import subprocess
 import sys
 
-# Check if pkg_resources is available, if not install setuptools
-try:
-    import pkg_resources
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "setuptools"])
-    import pkg_resources  # Try again
-warnings.filterwarnings('ignore')
-
 # Set page config
 st.set_page_config(
     page_title="GPR Data Processor",
@@ -1818,6 +1810,7 @@ st.markdown(
     "</div>",
     unsafe_allow_html=True
 )
+
 
 
 
