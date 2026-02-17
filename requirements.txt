@@ -3,6 +3,7 @@ pip==26.0.1
 numpy
 pandas
 matplotlib
+Pillow
 scipy
 setuptools>=65.0.0  # Explicit version
 wheel  # Often needed with setuptools
