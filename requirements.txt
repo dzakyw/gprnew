@@ -5,7 +5,7 @@ pandas
 matplotlib
 Pillow
 scipy
-setuptools>=65.0.0  # Explicit version
+setuptools==82.0.0# Explicit version
 wheel  # Often needed with setuptools
 geographiclib==1.49
 geopy==1.18.1
