@@ -672,9 +672,10 @@ if dzt_file and process_btn:
             # Try to import readgssi
             try:
                 from readgssi import readgssi
-            except ImportError:
-                st.error("⚠️ readgssi not installed! Please run:")
-                st.code("pip install readgssi")
+            except ImportError as e:
+                st.error(f"Failed to import readgssi: {e}")
+                import traceback
+                st.code(traceback.format_exc())
                 st.stop()
             
             # Create progress bar
@@ -1808,3 +1809,4 @@ st.markdown(
     "</div>",
     unsafe_allow_html=True
 )
+
