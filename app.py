@@ -16,6 +16,16 @@ import warnings
 from scipy import signal
 from scipy.fft import fft, fftfreq, fftshift
 from scipy.interpolate import interp1d, griddata
+import subprocess
+import sys
+import pkg_resources
+
+# Check if pkg_resources is available, if not install setuptools
+try:
+    import pkg_resources
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "setuptools"])
+    import pkg_resources  # Try again
 warnings.filterwarnings('ignore')
 
 # Set page config
@@ -1809,4 +1819,5 @@ st.markdown(
     "</div>",
     unsafe_allow_html=True
 )
+
 
