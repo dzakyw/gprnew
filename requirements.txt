@@ -10,7 +10,7 @@ wheel  # Often needed with setuptools
 geographiclib==1.49
 geopy==1.18.1
 git+https://github.com/Knio/pynmea2.git
-git+https://github.com/iannesbitt/readgssi.git#egg=readgssi
+readgssi
 pytz
 obspy
 h5py
