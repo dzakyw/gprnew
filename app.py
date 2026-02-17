@@ -1441,13 +1441,13 @@ def get_window_indices(x_axis, y_axis, depth_min, depth_max, distance_min, dista
     }
 
 # Main content
-if csv_file and process_btn:
+if csv_file and process_btn:   # <-- CHANGED from dzt_file to csv_file
     with st.spinner("Processing GPR data from CSV..."):
         try:
             # Create progress bar
             progress_bar = st.progress(0)
 
-            # ---------- NEW: Read CSV ----------
+            # ---------- NEW: Read CSV directly ----------
             df = pd.read_csv(csv_file, header=0, index_col=0)
             original_array = df.values.astype(np.float32)
             n_samples, n_traces = original_array.shape
@@ -1455,7 +1455,7 @@ if csv_file and process_btn:
 
             progress_bar.progress(20)
 
-            # ---------- Process coordinates (unchanged) ----------
+            # ---------- Process coordinates if provided (unchanged) ----------
             coordinates_data = None
             if coord_csv:
                 try:
@@ -1468,22 +1468,94 @@ if csv_file and process_btn:
 
             progress_bar.progress(30)
 
-            # ---------- Line reversal (unchanged) ----------
+            # ---------- Apply line reversal (unchanged) ----------
             if reverse_line:
                 original_array = reverse_array(original_array)
                 st.session_state.line_reversed = True
                 st.info("✓ Line direction reversed (A→B to B→A)")
             else:
                 st.session_state.line_reversed = False
+
             st.session_state.reverse_line = reverse_line
 
-            # ---------- Trace muting (unchanged) ----------
-            # ... (your existing muting code) ...
+            # ---------- Apply trace muting (unchanged) ----------
+            if mute_traces:
+                st.session_state.mute_applied = True
+
+                # Prepare mute parameters
+                mute_params = {
+                    'strength': mute_strength
+                }
+
+                # Create distance axis for muting if needed
+                mute_x_axis = None
+                if coordinates_data is not None and use_coords_for_distance:
+                    mute_x_axis = coordinates_data['distance']
+                elif not use_coords_for_distance and distance_unit != "traces":
+                    mute_x_axis = np.linspace(0, total_distance, original_array.shape[1])
+
+                if mute_method == "By Distance":
+                    mute_params.update({
+                        'method': 'By Distance',
+                        'start': mute_start_dist,
+                        'end': mute_end_dist,
+                        'apply_taper': apply_taper if 'apply_taper' in locals() else False,
+                        'taper_length': taper_length/100 if 'taper_length' in locals() else 0.1
+                    })
+
+                    muted_array, mute_mask = apply_trace_mute(
+                        original_array, mute_params, mute_x_axis, coordinates_data
+                    )
+                    original_array = muted_array
+                    st.session_state.mute_mask = mute_mask
+                    st.session_state.mute_zones = [mute_params]
+
+                elif mute_method == "By Trace Index":
+                    mute_params.update({
+                        'method': 'By Trace Index',
+                        'start': mute_start_idx,
+                        'end': mute_end_idx,
+                        'apply_taper': apply_taper if 'apply_taper' in locals() else False,
+                        'taper_samples': taper_samples if 'taper_samples' in locals() else 10
+                    })
+
+                    muted_array, mute_mask = apply_trace_mute(
+                        original_array, mute_params, mute_x_axis, coordinates_data
+                    )
+                    original_array = muted_array
+                    st.session_state.mute_mask = mute_mask
+                    st.session_state.mute_zones = [mute_params]
+
+                elif mute_method == "Multiple Zones":
+                    processed_zones = []
+                    for zone in mute_zones:
+                        zone_params = {
+                            'method': zone['method'],
+                            'start': zone['start'],
+                            'end': zone['end'],
+                            'apply_taper': zone['taper'],
+                            'label': zone['label']
+                        }
+                        processed_zones.append(zone_params)
+
+                    muted_array, mute_mask = apply_multiple_mute_zones(
+                        original_array, processed_zones, mute_x_axis, coordinates_data
+                    )
+                    original_array = muted_array
+                    st.session_state.mute_mask = mute_mask
+                    st.session_state.mute_zones = processed_zones
+
+                st.success(f"✓ {len(st.session_state.mute_zones) if mute_method == 'Multiple Zones' else 1} mute zone(s) applied")
+            else:
+                st.session_state.mute_applied = False
+                st.session_state.mute_mask = None
+                st.session_state.mute_zones = None
 
             progress_bar.progress(40)
 
             # ---------- NEW: Apply time-zero adjustment ----------
             if time_zero > 0:
+                # Shift each trace upward, pad with zeros at bottom
                 shifted = np.zeros_like(original_array)
                 if time_zero < n_samples:
                     shifted[:-time_zero, :] = original_array[time_zero:, :]
@@ -1531,7 +1603,8 @@ if csv_file and process_btn:
             # ---------- NEW: Apply frequency filtering ----------
             if freq_filter:
                 from scipy import signal as scipy_signal
-                # Design a Butterworth bandpass filter (you can adjust order and type)
+                # Design a Butterworth bandpass filter
+                # (You may adjust the filter order and type as needed)
                 sos = scipy_signal.butter(4, [freq_min, freq_max], btype='band', fs=freq_max*2, output='sos')
                 filtered = np.zeros_like(original_array)
                 for i in range(n_traces):
@@ -1541,27 +1614,148 @@ if csv_file and process_btn:
 
             progress_bar.progress(70)
 
-            # ---------- Near-surface correction (unchanged) ----------
+            # ---------- Apply near-surface correction if requested (unchanged) ----------
             if apply_near_surface_correction:
-                # ... (your existing near-surface correction code) ...
+                st.session_state.near_surface_correction = True
+                st.session_state.correction_type = correction_type
+                st.session_state.correction_depth = correction_depth
 
-            # ---------- Deconvolution (unchanged) ----------
+                # Prepare correction parameters dictionary
+                correction_params = {}
+                if correction_type == "Linear Reduction":
+                    correction_params['surface_reduction'] = surface_reduction
+                    correction_params['depth_factor'] = depth_factor
+                elif correction_type == "Exponential Reduction":
+                    correction_params['exp_factor'] = exp_factor
+                    correction_params['max_reduction'] = max_reduction
+                elif correction_type == "Gaussian Filter":
+                    correction_params['filter_sigma'] = filter_sigma
+                    correction_params['filter_window'] = filter_window
+                elif correction_type == "Windowed Normalization":
+                    correction_params['window_size'] = window_size
+                    correction_params['target_amplitude'] = target_amplitude
+
+                original_array = apply_near_surface_correction(
+                    original_array,
+                    correction_type,
+                    correction_depth,
+                    max_depth if depth_unit != "samples" else None,
+                    **correction_params
+                )
+
+            # ---------- Apply deconvolution if requested (unchanged) ----------
             if apply_deconvolution:
-                # ... (your existing deconvolution code) ...
+                st.session_state.deconvolution_applied = True
+                st.session_state.deconv_method = deconv_method
+
+                # Prepare deconvolution parameters
+                deconv_params = {
+                    'deconv_window_start': deconv_window_start if 'deconv_window_start' in locals() else 0,
+                    'deconv_window_end': deconv_window_end if 'deconv_window_end' in locals() else 1000,
+                    'trace_for_wavelet': trace_for_wavelet if 'trace_for_wavelet' in locals() else 0,
+                    'use_average_wavelet': use_average_wavelet if 'use_average_wavelet' in locals() else True
+                }
+
+                # Add method-specific parameters
+                if deconv_method == "Wiener Filter":
+                    deconv_params.update({
+                        'wiener_window': wiener_window if 'wiener_window' in locals() else 21,
+                        'noise_level': noise_level if 'noise_level' in locals() else 0.01,
+                        'wavelet_length': wavelet_length if 'wavelet_length' in locals() else 51,
+                        'regularization': regularization if 'regularization' in locals() else 0.1
+                    })
+                elif deconv_method == "Predictive Deconvolution":
+                    deconv_params.update({
+                        'prediction_distance': prediction_distance if 'prediction_distance' in locals() else 10,
+                        'filter_length': filter_length if 'filter_length' in locals() else 50,
+                        'prewhitening': prewhitening if 'prewhitening' in locals() else 0.1,
+                        'iterations': iterations if 'iterations' in locals() else 3
+                    })
+                elif deconv_method == "Spiking Deconvolution":
+                    deconv_params.update({
+                        'spike_strength': spike_strength if 'spike_strength' in locals() else 0.8,
+                        'spike_length': spike_length if 'spike_length' in locals() else 21,
+                        'spike_noise': spike_noise if 'spike_noise' in locals() else 0.01,
+                        'spike_iterations': spike_iterations if 'spike_iterations' in locals() else 5
+                    })
+                elif deconv_method == "Minimum Entropy Deconvolution":
+                    deconv_params.update({
+                        'med_filter_length': med_filter_length if 'med_filter_length' in locals() else 80,
+                        'med_iterations': med_iterations if 'med_iterations' in locals() else 10,
+                        'med_convergence': med_convergence if 'med_convergence' in locals() else 0.001,
+                        'med_noise': med_noise if 'med_noise' in locals() else 0.01
+                    })
+                elif deconv_method == "Homomorphic Deconvolution":
+                    deconv_params.update({
+                        'homo_window': homo_window if 'homo_window' in locals() else 'hanning',
+                        'homo_cutoff': homo_cutoff if 'homo_cutoff' in locals() else 0.1,
+                        'homo_prewhiten': homo_prewhiten if 'homo_prewhiten' in locals() else 0.01,
+                        'homo_iterations': homo_iterations if 'homo_iterations' in locals() else 3
+                    })
+                elif deconv_method == "Bayesian Deconvolution":
+                    deconv_params.update({
+                        'bayesian_prior': bayesian_prior if 'bayesian_prior' in locals() else 'Laplace',
+                        'bayesian_iterations': bayesian_iterations if 'bayesian_iterations' in locals() else 1000,
+                        'bayesian_burnin': bayesian_burnin if 'bayesian_burnin' in locals() else 500,
+                        'bayesian_noise': bayesian_noise if 'bayesian_noise' in locals() else 0.01
+                    })
+
+                if use_average_wavelet:
+                    deconv_params['wavelet_trace_range'] = wavelet_trace_range if 'wavelet_trace_range' in locals() else 10
+
+                st.info(f"Applying {deconv_method} deconvolution...")
+                deconvolved_array = apply_deconvolution_to_array(
+                    original_array,
+                    deconv_method,
+                    **deconv_params
+                )
+
+                st.session_state.deconvolved_array = deconvolved_array
+                st.session_state.deconv_params = deconv_params
+
+                # Determine output based on user selection
+                if output_type == "Deconvolved Only":
+                    processed_array = deconvolved_array.copy()
+                elif output_type == "Deconvolved + Original":
+                    processed_array = 0.7 * deconvolved_array + 0.3 * original_array
+                elif output_type == "Difference (Deconvolved - Original)":
+                    processed_array = deconvolved_array - original_array
+                else:
+                    processed_array = deconvolved_array.copy()
+
+                st.success(f"✓ {deconv_method} deconvolution applied")
             else:
                 st.session_state.deconvolution_applied = False
                 processed_array = original_array.copy()
 
-            # ---------- Gain (unchanged) ----------
+            # ---------- Apply time-varying gain (unchanged) ----------
             processed_array = apply_gain(processed_array, gain_type,
-                                        # ... parameters ...
-                                        )
+                                        const_gain=const_gain if 'const_gain' in locals() else None,
+                                        min_gain=min_gain if 'min_gain' in locals() else None,
+                                        max_gain=max_gain if 'max_gain' in locals() else None,
+                                        base_gain=base_gain if 'base_gain' in locals() else None,
+                                        exp_factor=exp_factor if 'exp_factor' in locals() else None,
+                                        window_size=window_size if 'window_size' in locals() else None,
+                                        target_amplitude=target_amplitude if 'target_amplitude' in locals() else None,
+                                        power_gain=power_gain if 'power_gain' in locals() else None,
+                                        attenuation=attenuation if 'attenuation' in locals() else None)
 
             progress_bar.progress(80)
 
-            # ---------- Coordinate interpolation (unchanged) ----------
+            # ---------- Process coordinates if provided (unchanged) ----------
             if coord_csv and st.session_state.coordinates is not None:
-                # ... (your existing coordinate processing code) ...
+                try:
+                    coordinates_data = process_coordinates(
+                        st.session_state.coordinates,
+                        processed_array.shape[1],
+                        trace_col=trace_col if 'trace_col' in locals() else None,
+                        method=interp_method.lower() if 'interp_method' in locals() else 'linear'
+                    )
+                    st.session_state.interpolated_coords = coordinates_data
+                    if coordinates_data:
+                        st.success(f"✓ Interpolated {coordinates_data['original_points']} coordinate points to {coordinates_data['interpolated_points']} traces")
+                except Exception as e:
+                    st.warning(f"Coordinate processing failed: {str(e)}")
 
             progress_bar.progress(90)
 
@@ -1580,8 +1774,10 @@ if csv_file and process_btn:
             # Store axis scaling parameters (unchanged)
             st.session_state.depth_unit = depth_unit
             st.session_state.max_depth = max_depth if depth_unit != "samples" else None
+
             st.session_state.use_coords_for_distance = use_coords_for_distance
             st.session_state.coordinates_data = coordinates_data
+
             if not st.session_state.use_coords_for_distance:
                 st.session_state.distance_unit = distance_unit
                 st.session_state.total_distance = total_distance if distance_unit != "traces" else None
@@ -1589,7 +1785,7 @@ if csv_file and process_btn:
                 st.session_state.distance_unit = "meters"
                 st.session_state.total_distance = coordinates_data['distance'][-1] if coordinates_data else None
 
-            # Aspect ratio & windows (unchanged)
+            # Store aspect ratio
             st.session_state.aspect_mode = aspect_mode
             if aspect_mode == "Manual" and 'aspect_ratio_float' in locals():
                 st.session_state.aspect_ratio = aspect_ratio_float
@@ -1598,6 +1794,7 @@ if csv_file and process_btn:
             else:
                 st.session_state.aspect_ratio = None
 
+            # Store window parameters
             st.session_state.use_custom_window = use_custom_window
             if use_custom_window:
                 st.session_state.depth_min = depth_min if 'depth_min' in locals() else 0
@@ -1605,6 +1802,7 @@ if csv_file and process_btn:
                 if not st.session_state.use_coords_for_distance:
                     st.session_state.distance_min = distance_min if 'distance_min' in locals() else 0
                     st.session_state.distance_max = distance_max if 'distance_max' in locals() else total_distance
+
             st.session_state.multiple_windows = multiple_windows
             if multiple_windows and use_custom_window and 'windows' in locals():
                 st.session_state.additional_windows = windows
