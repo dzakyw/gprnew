@@ -18,7 +18,6 @@ from scipy.fft import fft, fftfreq, fftshift
 from scipy.interpolate import interp1d, griddata
 import subprocess
 import sys
-import pkg_resources
 
 # Check if pkg_resources is available, if not install setuptools
 try:
@@ -1819,5 +1818,6 @@ st.markdown(
     "</div>",
     unsafe_allow_html=True
 )
+
 
 
